@@ -1,100 +1,191 @@
-# claude-desktop-buddy
+# claude-desktop-buddy-StickS3
 
-Claude for macOS and Windows can connect Claude Cowork and Claude Code to
-maker devices over BLE, so developers and makers can build hardware that
-displays permission prompts, recent messages, and other interactions. We've
-been impressed by the creativity of the maker community around Claude -
-providing a lightweight, opt-in API is our way of making it easier to build
-fun little hardware devices that integrate with Claude.
+M5Stack StickS3 移植版，基于官方参考固件 [anthropics/claude-desktop-buddy](https://github.com/anthropics/claude-desktop-buddy)。
 
-> **Building your own device?** You don't need any of the code here. See
-> **[REFERENCE.md](REFERENCE.md)** for the wire protocol: Nordic UART
-> Service UUIDs, JSON schemas, and the folder push transport.
+Claude Desktop（macOS / Windows，开启 Developer Mode 后）可以通过 BLE 连接"硬件伙伴"设备，把会话状态、权限审批提示等推到小屏幕上。上游参考固件的目标是 M5StickC Plus（ESP32-PICO + AXP192），本仓库把它移植到 **M5Stack StickS3**（ESP32-S3 + M5PM1 + BMI270 + 210mAh）。
 
-As an example, we built a desk pet on ESP32 that lives off permission
-approvals and interaction with Claude. It sleeps when nothing's happening,
-wakes when sessions start, gets visibly impatient when an approval prompt is
-waiting, and lets you approve or deny right from the device.
+> 想自己从零做一台？不需要本仓库代码。BLE 协议规范看 **[REFERENCE.md](REFERENCE.md)**：Nordic UART Service UUID、JSON schema、文件夹推送协议。
 
 <p align="center">
-  <img src="docs/device.jpg" alt="M5StickC Plus running the buddy firmware" width="500">
+  <img src="docs/device.jpg" alt="M5Stack StickS3 running the buddy firmware" width="500">
 </p>
 
-## Hardware
+---
 
-The firmware targets ESP32 with the Arduino framework. As written, it
-depends on the M5StickCPlus library for its display, IMU, and button
-drivers—so you'll need that board, or a fork that swaps those drivers for
-your own pin layout.
+## 移植工作清单
 
-## Flashing
+### 1. 硬件 / HAL
 
-Install
-[PlatformIO Core](https://docs.platformio.org/en/latest/core/installation/),
-then:
+- 目标板：M5StickC Plus → **M5Stack StickS3**
+- HAL：`m5stack/M5StickCPlus` → **`m5stack/M5Unified`**
+- PlatformIO 平台：`espressif32` → **`pioarduino/platform-espressif32#54.03.20`**（ESP32-S3 支持）
+- CPU 240MHz / 8MB flash / LittleFS / `no_ota.csv` 分区
+- `ARDUINO_USB_MODE=1 + ARDUINO_USB_CDC_ON_BOOT=1`：USB 走 USB-Serial-JTAG 块，跟 GPIO19 LED 让路
+
+### 2. BLE 协议栈：Bluedroid → NimBLE
+
+从 Arduino-ESP32 自带的 Bluedroid 换成 `h2zero/NimBLE-Arduino @ ^2.2.0`。
+
+- connected idle 功耗约 **-30~50%**
+- RAM / flash 占用明显更小
+- 原版安全等级**等价迁移**：LE Secure Connections + MITM + bonding，IO capability DisplayOnly，两个 NUS 特性用 `READ_AUTHEN` / `WRITE_AUTHEN` 强制加密链路
+
+### 3. ⭐ 关键坑：macOS BLE 名字缓存导致 Claude Desktop 扫不到设备
+
+**这个问题值得单独一章，因为调试过程最曲折，且任何人烧过其他固件再刷本固件的 M5StickS3 都会踩。**
+
+#### 现象
+
+- LightBlue（macOS）：能看到一个设备，但名字显示成另一个固件（比如 `QuickVibeStick-S3`），Service UUID 却是我们固件的 NUS `6E400001-B5A3-F393-E0A9-E50E24DCCA9E`
+- nRF Connect（手机，没缓存过这块板子）：能看到正确的 `Claude-XXXX`
+- **Claude Desktop：扫不到设备，无法连接**
+- `sudo pkill bluetoothd` 无效，缓存仍在
+- `/Library/Preferences/com.apple.Bluetooth.plist` 里翻不到相关条目
+
+#### 根因
+
+macOS 的 `bluetoothd` 按 BLE 外设的 **Public MAC 地址** 缓存设备名。缓存持久化到 SIP 保护的磁盘位置（`/Library/Bluetooth/` 或类似），用户空间看不到也直接清不掉。
+
+这块板子之前烧过 [QuickVibeStickS3](https://github.com/) 固件并跟 Mac 连过，于是：
+
+1. `bluetoothd` 永久记录：`MAC=XX:XX:XX:XX:XX:XX → name="QuickVibeStick-S3"`
+2. 之后无论这个 MAC 广播什么名字，macOS 的 `CBPeripheral.name` 都返回缓存值
+3. LightBlue 用 `CBPeripheral.name` 显示 → 看到旧名字
+4. Claude Desktop 按名字前缀 `Claude` 过滤（[REFERENCE.md:31](REFERENCE.md#L31)） → 直接过滤掉，扫不到
+5. 但 `CBAdvertisementDataLocalNameKey`（广播包里的 raw local name AD）其实是 `Claude-XXXX` —— 手机没缓存所以能正确显示
+
+#### 定位过程（走过的弯路）
+
+1. 怀疑 NimBLE 广播包不合规 → 打开 `CORE_DEBUG_LEVEL=4`，串口日志显示 `setAdvertisementData`/`setScanResponseData` 字节完全正确
+2. 怀疑 31 字节广告包溢出 → 加 `enableScanResponse(true) + setName()` 把名字放进 scan response，LightBlue 里显示出 `Local Name: Claude-5AF5`，但**整体条目名依旧是 `QuickVibeStick-S3`**，Claude Desktop 还是扫不到
+3. 用**从没连过这块板子的手机**装 nRF Connect 扫 → 看到正确的 `Claude-5AF5`，证明固件没问题
+4. 结论：**macOS 按 public MAC 缓存了名字**
+
+#### 解法
+
+让设备用 **BLE Static Random Address**，macOS 按新地址当新设备，没有历史缓存可查。
+
+```cpp
+// src/ble_bridge.cpp
+uint8_t mac[6] = {0};
+esp_read_mac(mac, ESP_MAC_BT);
+// NimBLE 期望 little-endian；把 public MAC 反序，然后强制最高 2 bit 为 11
+// 满足 BT Core Spec 对 Static Random Address 的约束。
+uint8_t addr[6] = { mac[5], mac[4], mac[3], mac[2], mac[1], mac[0] };
+addr[5] |= 0xC0;
+NimBLEDevice::setOwnAddr(addr);
+NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
+```
+
+- **从 eFuse BT MAC 派生**：同一块板子每次启动得到相同的 Random Address → 配对一次 bond 就能持续自动重连
+- **与 public MAC 不同**：绕开 macOS 的旧名字缓存，Claude Desktop 能正确看到 `Claude-XXXX`
+
+配套还显式把 Local Name 放到 scan response（主广告包装不下 flags + 128-bit NUS UUID + 名字，31 字节会溢出）：
+
+```cpp
+adv->enableScanResponse(true);     // 必须先调，否则 setName 会塞进主广告包
+adv->addServiceUUID(svc->getUUID());
+adv->setName(deviceName);          // NimBLE 2.x 自动路由到 scan response
+```
+
+#### 触发条件与影响
+
+- 任何人**首次**刷这个固件到**没烧过其他 BLE 固件**的 StickS3：不触发此坑
+- 同一台板子刷过 QuickVibe / 其他自定义固件再刷本固件：触发，但我们的 Random Address 直接绕开，用户无感知
+- 同一台 Mac 连过多个不同设备：不影响，每个设备有自己的 MAC→name 记录
+
+### 4. 功耗优化
+
+StickS3 屏 135×240 相比 StickC Plus 80×160 像素多 2.5 倍，背光是耗电大头。几项针对性优化：
+
+| 项 | 原版 | 本版 | 影响 |
+|---|---|---|---|
+| 默认亮度 | 4/4 | **2/4** | 背光 -40% |
+| nap（面朝下）CPU | 240MHz | **80MHz** | nap 期 CPU 动态功耗 -66% |
+| screen off 等待 | `delay(100)` | **`esp_light_sleep_start()`** 100ms | idle 整机从 ~40mA 降到 ~5mA，BLE 链接保持 |
+| BLE 广播间隔 | ~30ms（Bluedroid 默认） | **500-800ms** | 未连接时 adv 功耗 -20× |
+| IMU | MPU6886 ~3.8mA | BMI270 ~420µA（硬件差异） | 持续 -3.4mA |
+
+活跃续航跟原版基本持平（背光涨幅被 210mAh 电池和上述优化抵消）。
+
+### 5. StickS3 硬件差异说明
+
+- **无硬件 RTC**：断电后时间丢失。`tokens_today` 要等桌面端在当天推过 `{"time":[...]}` 才会正常滚动
+- **电池电流 `bat.mA` 是哨兵值**：M5PM1 没有电流寄存器。充电中置 `-1`，放电时按 REFERENCE.md 的 "omit fields you don't have" 省略。桌面端 `mA < 0` 仍渲染为充电
+- **电源键只有两态**：短按切屏，长按 6s 硬关机（无 AXP192 的多击）
+- **LED = GPIO19（active-low）**：跟 USB D+ 共用物理引脚，靠 `ARDUINO_USB_MODE=1` 切 USB-Serial-JTAG 块避开
+- **芯片温度 ±10°C**：读 ESP32-S3 内置传感器（不是 PMIC 温度），仅供参考
+- **Info → Credits 的 source URL** 已改为本仓库地址
+
+---
+
+## 编译烧录
+
+需要 [PlatformIO Core](https://docs.platformio.org/en/latest/core/installation/)。
 
 ```bash
 pio run -t upload
 ```
 
-If you're starting from a previously-flashed device, wipe it first:
+彻底擦除再刷：
 
 ```bash
 pio run -t erase && pio run -t upload
 ```
 
-Once running, you can also wipe everything from the device itself: **hold A
-→ settings → reset → factory reset → tap twice**.
+或设备端出厂重置：按住 A → Settings → Reset → Factory reset → 点两次。
 
-## Pairing
+---
 
-To pair your device with Claude, first enable developer mode (**Help →
-Troubleshooting → Enable Developer Mode**). Then, open the Hardware Buddy
-window in **Developer → Open Hardware Buddy…**, click **Connect**, and pick
-your device from the list. macOS will prompt for Bluetooth permission on
-first connect; grant it.
+## 配对
+
+1. Claude Desktop：**Help → Troubleshooting → Enable Developer Mode**
+2. **Developer → Open Hardware Buddy…** → **Connect**
+3. 从列表选 `Claude-XXXX`（XXXX 是 Random Static Address 末两字节，与 BT MAC 不同）
+4. macOS 首次连会弹出配对框，设备屏幕会显示 6 位 passkey → 在 Mac 上输入
+5. 配对成功，bond 存到设备 NVS，后续自动加密重连
 
 <p align="center">
-  <img src="docs/menu.png" alt="Developer → Open Hardware Buddy… menu item" width="420">
-  <img src="docs/hardware-buddy-window.png" alt="Hardware Buddy window with Connect button and folder drop target" width="420">
+  <img src="docs/menu.png" alt="Developer → Open Hardware Buddy…" width="420">
+  <img src="docs/hardware-buddy-window.png" alt="Hardware Buddy window" width="420">
 </p>
 
-Once paired, the bridge auto-reconnects whenever both sides are awake.
+### Claude Desktop 扫不到？
 
-If discovery isn't finding the stick:
+本固件用的 Static Random Address 已经绕开最常见的 macOS 缓存问题。如果仍然扫不到，按顺序排查：
 
-- Make sure it's awake (any button press)
-- Check the stick's settings menu → bluetooth is on
+1. 设备醒着吗？任意按键唤醒屏幕
+2. 用手机 nRF Connect 扫一下，应该能看到 `Claude-XXXX`。如果**手机都扫不到**，固件端有问题 —— 抓串口日志（`pio device monitor -b 115200`，先把 `CORE_DEBUG_LEVEL` 临时改回 4）
+3. 如果手机能扫到、Mac 扫不到 → System Settings → Bluetooth 里翻一遍，Forget 任何可疑旧条目
+4. 实在不行：Option-点菜单栏蓝牙图标 → Reset the Bluetooth module
 
-## Controls
+---
+
+## 控制
 
 |                         | Normal               | Pet         | Info        | Approval    |
 | ----------------------- | -------------------- | ----------- | ----------- | ----------- |
-| **A** (front)           | next screen          | next screen | next screen | **approve** |
-| **B** (right)           | scroll transcript    | next page   | next page   | **deny**    |
-| **Hold A**              | menu                 | menu        | menu        | menu        |
-| **Power** (left, short) | toggle screen off    |             |             |             |
-| **Power** (left, ~6s)   | hard power off       |             |             |             |
-| **Shake**               | dizzy                |             |             | —           |
-| **Face-down**           | nap (energy refills) |             |             |             |
+| **A**（前面）           | 下一屏                | 下一屏       | 下一屏       | **approve** |
+| **B**（右侧）           | 滚动 transcript       | 下一页       | 下一页       | **deny**    |
+| **Hold A**              | 菜单                  | 菜单         | 菜单         | 菜单         |
+| **电源**（左侧短按）    | 切屏                  |              |              |              |
+| **电源**（左侧长按 6s） | 硬关机                |              |              |              |
+| **摇动**                | dizzy                |              |              | —            |
+| **朝下**                | nap（回能量、降频）   |              |              |              |
 
-The screen auto-powers-off after 30s of no interaction (kept on while an
-approval prompt is up). Any button press wakes it.
+30 秒无交互后自动关屏（审批过程中保持常亮）；任意按键唤醒。
 
-## ASCII pets
+---
 
-Eighteen pets, each with seven animations (sleep, idle, busy, attention,
-celebrate, dizzy, heart). Menu → "next pet" cycles them with a counter.
-Choice persists to NVS.
+## ASCII 宠物
 
-## GIF pets
+18 种，每种 7 组动画（sleep / idle / busy / attention / celebrate / dizzy / heart）。Menu → "next pet" 切换，NVS 持久化。
 
-If you want a custom GIF character instead of an ASCII buddy, drag a
-character pack folder onto the drop target in the Hardware Buddy window. The
-app streams it over BLE and the stick switches to GIF mode live. **Settings
-→ delete char** reverts to ASCII mode.
+## GIF 宠物
 
-A character pack is a folder with `manifest.json` and 96px-wide GIFs:
+往 Hardware Buddy 窗口的投放区拖一个字符包文件夹，桌面端通过 BLE 推到设备，自动切到 GIF 模式。**Settings → delete char** 回 ASCII。
+
+字符包结构：`manifest.json` + 一堆 96px 宽的 GIF：
 
 ```json
 {
@@ -118,55 +209,46 @@ A character pack is a folder with `manifest.json` and 96px-wide GIFs:
 }
 ```
 
-State values can be a single filename or an array. Arrays rotate: each
-loop-end advances to the next GIF, useful for an idle activity carousel so
-the home screen doesn't loop one clip forever.
+- state 值可以是单个文件名或数组；数组会每次动画循环结束切下一个
+- GIF 宽 96px，高 ≤140px 能塞进 135×240 竖屏
+- 整个文件夹 ≤1.8MB；`gifsicle --lossy=80 -O3 --colors 64` 通常能压掉 40-60%
+- `tools/prep_character.py` 负责对齐尺寸
+- `tools/flash_character.py characters/bufo` 跳过 BLE，直接走 USB 把 `data/` 刷进去
 
-GIFs are 96px wide; height up to ~140px stays on a 135×240 portrait screen.
-Crop tight to the character — transparent margins waste screen and shrink
-the sprite. `tools/prep_character.py` handles the resize: feed it source
-GIFs at any sizes and it produces a 96px-wide set where the character is the
-same scale in every state.
+参考 `characters/bufo/`。
 
-The whole folder must fit under 1.8MB —
-`gifsicle --lossy=80 -O3 --colors 64` typically cuts 40–60%.
+## 七种状态
 
-See `characters/bufo/` for a working example.
+| 状态        | 触发                       | 感觉                       |
+| ----------- | -------------------------- | -------------------------- |
+| `sleep`     | 桥未连接                    | 闭眼呼吸                   |
+| `idle`      | 已连接，无事                | 眨眼、环顾                 |
+| `busy`      | 会话在跑                    | 流汗、工作                 |
+| `attention` | 有待审批                    | 警觉、**LED 闪烁**         |
+| `celebrate` | 升级（每 50K tokens）       | 撒花、跳动                 |
+| `dizzy`     | 摇了设备                    | 眼睛转圈                   |
+| `heart`     | 5 秒内批准                  | 飘爱心                     |
 
-If you're iterating on a character and would rather skip the BLE round-trip,
-`tools/flash_character.py characters/bufo` stages it into `data/` and runs
-`pio run -t uploadfs` directly over USB.
+---
 
-## The seven states
-
-| State       | Trigger                     | Feel                        |
-| ----------- | --------------------------- | --------------------------- |
-| `sleep`     | bridge not connected        | eyes closed, slow breathing |
-| `idle`      | connected, nothing urgent   | blinking, looking around    |
-| `busy`      | sessions actively running   | sweating, working           |
-| `attention` | approval pending            | alert, **LED blinks**       |
-| `celebrate` | level up (every 50K tokens) | confetti, bouncing          |
-| `dizzy`     | you shook the stick         | spiral eyes, wobbling       |
-| `heart`     | approved in under 5s        | floating hearts             |
-
-## Project layout
+## 项目结构
 
 ```
 src/
-  main.cpp       — loop, state machine, UI screens
-  buddy.cpp      — ASCII species dispatch + render helpers
-  buddies/       — one file per species, seven anim functions each
-  ble_bridge.cpp — Nordic UART service, line-buffered TX/RX
-  character.cpp  — GIF decode + render
-  data.h         — wire protocol, JSON parse
-  xfer.h         — folder push receiver
-  stats.h        — NVS-backed stats, settings, owner, species choice
-characters/      — example GIF character packs
-tools/           — generators and converters
+  main.cpp        ─ 主循环、状态机、UI、电源管理
+  buddy.cpp       ─ ASCII 物种分发
+  buddies/        ─ 每个物种一个文件，7 个动画函数
+  ble_bridge.cpp  ─ NUS 桥（含 Static Random Address 派生）
+  character.cpp   ─ GIF 解码渲染
+  data.h          ─ 协议解析
+  xfer.h          ─ 文件夹推送接收器
+  stats.h         ─ NVS 持久化（stats / settings / owner / 物种选择）
+characters/       ─ 示例 GIF 包
+tools/            ─ 转换 / 辅助脚本
 ```
 
-## Availability
+---
 
-The BLE API is only available when the desktop apps are in developer mode
-(**Help → Troubleshooting → Enable Developer Mode**). It's intended for
-makers and developers and isn't an officially supported product feature.
+## 可用性
+
+BLE API 仅在桌面端开启 Developer Mode 后可用（**Help → Troubleshooting → Enable Developer Mode**），面向 maker / 开发者，非官方正式功能。

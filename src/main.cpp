@@ -1,11 +1,13 @@
-#include <M5StickCPlus.h>
+#include <M5Unified.h>
 #include <LittleFS.h>
 #include <stdarg.h>
+#include <esp_mac.h>
+#include <esp_sleep.h>
 #include "ble_bridge.h"
 #include "data.h"
 #include "buddy.h"
 
-TFT_eSprite spr = TFT_eSprite(&M5.Lcd);
+M5Canvas spr = M5Canvas(&M5.Lcd);
 
 // Advertise as "Claude-XXXX" (last two BT MAC bytes) so multiple sticks
 // in one room are distinguishable in the desktop picker. Name persists in
@@ -23,7 +25,7 @@ static void startBt() {
 const int W = 135, H = 240;
 const int CX = W / 2;
 const int CY_BASE = 120;
-const int LED_PIN = 10;          // red LED, active-low
+const int LED_PIN = 19;          // red LED, active-low (StickS3 GPIO19, shared with USB D+)
 
 // Colors used across multiple UI surfaces
 const uint16_t HOT   = 0xFA20;   // red-orange: warnings, impatience, deny
@@ -43,7 +45,7 @@ unsigned long t = 0;
 // Menu
 bool    menuOpen    = false;
 uint8_t menuSel     = 0;
-uint8_t brightLevel = 4;           // 0..4 → ScreenBreath 20..100
+uint8_t brightLevel = 2;           // 0..4 → brightness 60..252; default 2 for longer runtime on the S3's larger backlight
 bool    btnALong    = false;
 
 enum DisplayMode { DISP_NORMAL, DISP_PET, DISP_INFO, DISP_COUNT };
@@ -89,17 +91,19 @@ uint32_t promptArrivedMs = 0;
 
 // Face-down = Z-axis dominant and negative. Debounced so a toss doesn't count.
 static bool isFaceDown() {
-  float ax, ay, az;
-  M5.Imu.getAccelData(&ax, &ay, &az);
+  auto d = M5.Imu.getImuData();
+  float ax = d.accel.x, ay = d.accel.y, az = d.accel.z;
   return az < -0.7f && fabsf(ax) < 0.4f && fabsf(ay) < 0.4f;
 }
 
-static void applyBrightness() { M5.Axp.ScreenBreath(20 + brightLevel * 20); }
+// brightLevel 0..4 → M5Unified brightness 60..252 (matches StickCPlus
+// ScreenBreath 20..100 mapped to the 0..255 range).
+static void applyBrightness() { M5.Display.setBrightness(60 + brightLevel * 48); }
 
 static void wake() {
   lastInteractMs = millis();
   if (screenOff) {
-    M5.Axp.SetLDO2(true);
+    M5.Display.wakeup();
     applyBrightness();
     screenOff = false;
     wakeTransitionUntil = millis() + 12000;
@@ -109,7 +113,7 @@ static void wake() {
 bool     responseSent = false;
 
 static void beep(uint16_t freq, uint16_t dur) {
-  if (settings().sound) M5.Beep.tone(freq, dur);
+  if (settings().sound) M5.Speaker.tone(freq, dur);
 }
 
 static void sendCmd(const char* json) {
@@ -305,7 +309,7 @@ static void drawReset() {
 void menuConfirm() {
   switch (menuSel) {
     case 0: settingsOpen = true; menuOpen = false; settingsSel = 0; break;
-    case 1: M5.Axp.PowerOff(); break;
+    case 1: M5.Power.powerOff(); break;
     case 2:
     case 3:
       menuOpen = false;
@@ -349,21 +353,21 @@ static uint8_t paintedOrient = 0;
 // RTC and IMU share an I2C bus. Reading the RTC at 60fps starves the IMU
 // reads in clockUpdateOrient — orientation detection gets noisy. Cache the
 // time once per second; mood logic and drawClock both read from here.
-static RTC_TimeTypeDef _clkTm;
-static RTC_DateTypeDef _clkDt;
+static m5::rtc_time_t _clkTm;
+static m5::rtc_date_t _clkDt;
 uint32_t               _clkLastRead = 0;   // zeroed by data.h on time-sync
 static bool            _onUsb       = false;
 static void clockRefreshRtc() {
   if (millis() - _clkLastRead < 1000) return;
   _clkLastRead = millis();
-  _onUsb = M5.Axp.GetVBusVoltage() > 4.0f;
-  M5.Rtc.GetTime(&_clkTm);
-  M5.Rtc.GetDate(&_clkDt);
+  _onUsb = (M5.Power.isCharging() == m5::Power_Class::is_charging);
+  M5.Rtc.getTime(&_clkTm);
+  M5.Rtc.getDate(&_clkDt);
 }
 
 static void clockUpdateOrient() {
-  float ax, ay, az;
-  M5.Imu.getAccelData(&ax, &ay, &az);
+  auto d = M5.Imu.getImuData();
+  float ax = d.accel.x, ay = d.accel.y, az = d.accel.z;
   uint8_t lock = settings().clockRot;
   if (lock == 1) { clockOrient = 0; return; }
   if (lock == 2) {
@@ -408,13 +412,13 @@ static const char* const MON[] = {
 };
 static const char* const DOW[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
 
-static uint8_t clockDow() { return _clkDt.WeekDay % 7; }
+static uint8_t clockDow() { return _clkDt.weekDay % 7; }
 static void drawClock() {
   const Palette& p = characterPalette();
-  char hm[6]; snprintf(hm, sizeof(hm), "%02u:%02u", _clkTm.Hours, _clkTm.Minutes);
-  char ss[4]; snprintf(ss, sizeof(ss), ":%02u", _clkTm.Seconds);
-  uint8_t mi = (_clkDt.Month >= 1 && _clkDt.Month <= 12) ? _clkDt.Month - 1 : 0;
-  char dl[8]; snprintf(dl, sizeof(dl), "%s %02u", MON[mi], _clkDt.Date);
+  char hm[6]; snprintf(hm, sizeof(hm), "%02u:%02u", _clkTm.hours, _clkTm.minutes);
+  char ss[4]; snprintf(ss, sizeof(ss), ":%02u", _clkTm.seconds);
+  uint8_t mi = (_clkDt.month >= 1 && _clkDt.month <= 12) ? _clkDt.month - 1 : 0;
+  char dl[8]; snprintf(dl, sizeof(dl), "%s %02u", MON[mi], _clkDt.date);
 
   if (clockOrient == 0) {
     paintedOrient = 0;
@@ -439,10 +443,10 @@ static void drawClock() {
 
   // Seconds tick at 1Hz; redrawing 3 strings at 60fps is 180 SPI ops/sec
   // for nothing. Gate on the second changing (or full repaint).
-  if (repaint || _clkTm.Seconds != lastSec) {
-    lastSec = _clkTm.Seconds;
-    char wdl[12]; snprintf(wdl, sizeof(wdl), "%s %s %02u", DOW[clockDow()], MON[mi], _clkDt.Date);
-    char ssl[3]; snprintf(ssl, sizeof(ssl), "%02u", _clkTm.Seconds);
+  if (repaint || _clkTm.seconds != lastSec) {
+    lastSec = _clkTm.seconds;
+    char wdl[12]; snprintf(wdl, sizeof(wdl), "%s %s %02u", DOW[clockDow()], MON[mi], _clkDt.date);
+    char ssl[3]; snprintf(ssl, sizeof(ssl), "%02u", _clkTm.seconds);
     M5.Lcd.setTextDatum(MC_DATUM);
     M5.Lcd.setTextSize(3); M5.Lcd.setTextColor(p.text, p.bg);    M5.Lcd.drawString(hm, 170, 42);
     M5.Lcd.setTextSize(2); M5.Lcd.setTextColor(p.textDim, p.bg); M5.Lcd.drawString(ssl, 170, 72);
@@ -490,8 +494,8 @@ void triggerOneShot(PersonaState s, uint32_t durMs) {
 }
 
 bool checkShake() {
-  float ax, ay, az;
-  M5.Imu.getAccelData(&ax, &ay, &az);
+  auto d = M5.Imu.getImuData();
+  float ax = d.accel.x, ay = d.accel.y, az = d.accel.z;
   float mag = sqrtf(ax*ax + ay*ay + az*az);
   float delta = fabsf(mag - accelBaseline);
   accelBaseline = accelBaseline * 0.95f + mag * 0.05f;
@@ -593,14 +597,16 @@ void drawInfo() {
   } else if (infoPage == 3) {
     _infoHeader(p, y, "DEVICE", infoPage);
 
-    int vBat_mV = (int)(M5.Axp.GetBatVoltage() * 1000);
-    int iBat_mA = (int)M5.Axp.GetBatCurrent();
-    int vBus_mV = (int)(M5.Axp.GetVBusVoltage() * 1000);
+    // M5PM1 PMIC on StickS3 has no current/VBUS readings. Use charging
+    // state (digital) as the proxy; report mA=0 on the page.
+    int vBat_mV = M5.Power.getBatteryVoltage();   // M5Unified returns mV
+    int iBat_mA = 0;                              // not measurable on M5PM1
+    bool usb = (M5.Power.isCharging() == m5::Power_Class::is_charging);
+    int vBus_mV = usb ? 5000 : 0;                 // nominal — no real read
     int pct = (vBat_mV - 3200) / 10;   // (v-3.2)/(4.2-3.2)*100 = (v-3.2)*100 = (mv-3200)/10
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
-    bool usb = vBus_mV > 4000;
-    bool charging = usb && iBat_mA > 1;
-    bool full = usb && vBat_mV > 4100 && iBat_mA < 10;
+    bool charging = usb && vBat_mV < 4100;
+    bool full = usb && vBat_mV >= 4100;
 
     spr.setTextColor(p.text, p.bg);
     spr.setTextSize(2);
@@ -627,7 +633,7 @@ void drawInfo() {
     ln("  heap     %uKB", ESP.getFreeHeap() / 1024);
     ln("  bright   %u/4", brightLevel);
     ln("  bt       %s", settings().bt ? (dataBtActive() ? "linked" : "on") : "off");
-    ln("  temp     %dC", (int)M5.Axp.GetTempInAXP192());
+    ln("  temp     %dC", (int)temperatureRead());   // ESP32-S3 internal, ±10C
 
   } else if (infoPage == 4) {
     _infoHeader(p, y, "BLUETOOTH", infoPage);
@@ -676,14 +682,15 @@ void drawInfo() {
     ln("source");
     y += 4;
     spr.setTextColor(p.text, p.bg);
-    ln("github.com/anthropics");
+    ln("github.com/ApexLGF");
     ln("/claude-desktop-buddy");
+    ln("-StickS3");
     y += 12;
     spr.setTextColor(p.textDim, p.bg);
     ln("hardware");
     y += 4;
-    ln("M5StickC Plus");
-    ln("ESP32 + AXP192");
+    ln("M5Stack StickS3");
+    ln("ESP32-S3");
   }
 }
 
@@ -936,10 +943,17 @@ void drawHUD() {
 }
 
 void setup() {
-  M5.begin();
+  Serial.begin(115200);
+  delay(50);
+  // M5Unified auto-configures board (m5stack-sticks3): IMU (BMI270),
+  // display, buttons, PMIC (M5PM1), speaker. No hardware RTC on StickS3.
+  auto cfg = M5.config();
+  cfg.fallback_board = m5::board_t::board_M5StickS3;
+  cfg.internal_imu = true;
+  cfg.internal_rtc = false;
+  M5.begin(cfg);
   M5.Lcd.setRotation(0);
-  M5.Imu.Init();
-  M5.Beep.begin();
+  M5.Lcd.fillScreen(0x0000);
   startBt();
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);   // off
@@ -987,7 +1001,6 @@ void setup() {
 
 void loop() {
   M5.update();
-  M5.Beep.update();
   t++;
   uint32_t now = millis();
 
@@ -1051,13 +1064,15 @@ void loop() {
     wake();
   }
 
-  // AXP power button (left side): short-press toggles screen off.
-  // Long-press (6s) still powers off the device via AXP hardware.
-  if (M5.Axp.GetBtnPress() == 0x02) {
+  // Power button (left side): short-press toggles screen off. Long-press
+  // 6s hard-shuts down via PMIC hardware (no software handling needed).
+  // Note: on StickS3/M5PM1, M5.Power.getKeyState() is a no-op — we read
+  // the digital button line via M5.BtnPWR.
+  if (M5.BtnPWR.wasPressed()) {
     if (screenOff) {
       wake();
     } else {
-      M5.Axp.SetLDO2(false);
+      M5.Display.sleep();
       screenOff = true;
     }
   }
@@ -1170,7 +1185,7 @@ void loop() {
     bool weekend = (dow == 0 || dow == 6);
     bool friday  = (dow == 5);
 
-    uint8_t h = _clkTm.Hours;
+    uint8_t h = _clkTm.hours;
     if (h >= 1 && h < 7)             activeState = P_SLEEP;
     else if (weekend)                activeState = (now/8000 % 6 == 0) ? P_HEART : P_SLEEP;
     else if (h < 9)                  activeState = (now/6000 % 4 == 0) ? P_IDLE  : P_SLEEP;
@@ -1243,10 +1258,12 @@ void loop() {
   if (!napping && faceDownFrames >= 15) {
     napping = true;
     napStartMs = now;
-    M5.Axp.ScreenBreath(8);
+    M5.Display.setBrightness(30);   // dim but still visible — matches old ScreenBreath(8)
     dimmed = true;
+    setCpuFrequencyMhz(80);         // nap = nothing to render, drop clock for power
   } else if (napping && faceDownFrames <= -8) {
     napping = false;
+    setCpuFrequencyMhz(240);
     statsOnNapEnd((now - napStartMs) / 1000);
     statsOnWake();
     wake();
@@ -1257,9 +1274,18 @@ void loop() {
   // No auto-off on USB power — clock face wants to stay visible while charging.
   if (!screenOff && !inPrompt && !_onUsb
       && millis() - lastInteractMs > SCREEN_OFF_MS) {
-    M5.Axp.SetLDO2(false);
+    M5.Display.sleep();
     screenOff = true;
   }
 
-  delay(screenOff ? 100 : 16);
+  // When the screen is off the loop has nothing urgent to do — trade the
+  // 100 ms busy-wait for a timer-gated light sleep. The BT controller
+  // handles its own modem sleep around this, so an active BLE link stays
+  // up; wake latency on timer expiry is a few ms.
+  if (screenOff) {
+    esp_sleep_enable_timer_wakeup(100000);  // 100 ms
+    esp_light_sleep_start();
+  } else {
+    delay(16);
+  }
 }
